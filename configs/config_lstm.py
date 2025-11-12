@@ -1,0 +1,26 @@
+# config_lstm.py
+# Configuration for LSTM seq2seq model
+MODEL_NAME = "LSTM"
+USE_TDA = False
+
+# data
+CSV_PATH = "data/preprocessed_mental_health_chatbot.csv"
+INPUT_COL = "human_input"
+OUTPUT_COL = "assistant_output"
+MAX_EXAMPLES = 50
+
+# model
+EMBED_SIZE = 256
+HIDDEN_SIZE = 512
+NUM_LAYERS = 1
+DROPOUT = 0.2
+MAX_VOCAB_SIZE = 20000
+MIN_FREQ = 1
+
+# training
+BATCH_SIZE = 32
+NUM_EPOCHS = 5
+LEARNING_RATE = 1e-3
+TEACHER_FORCING_RATIO = 0.5
+MAX_OUTPUT_LEN = 100
+SEED = 42

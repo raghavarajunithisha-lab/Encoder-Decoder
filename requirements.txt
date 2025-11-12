@@ -1,0 +1,15 @@
+torch
+transformers
+datasets
+evaluate
+sacrebleu
+tqdm
+pandas
+numpy
+scikit-learn
+gensim
+gudhi
+nltk
+bert_score
+transformers[torch]
+
