@@ -1,13 +1,12 @@
-# config_bart.py
-# Configuration for BART fine-tuning (HF Trainer)
+
 MODEL_NAME = "BART"
-USE_TDA = True
+USE_TDA = False
 
 # data
 CSV_PATH = "data/preprocessed_mental_health_chatbot.csv"
-INPUT_COL = "input"
-OUTPUT_COL = "output"
-MAX_EXAMPLES = 50
+INPUT_COL = "human_input"
+OUTPUT_COL = "assistant_output"
+MAX_EXAMPLES = None
 
 # training
 BART_MODEL_NAME = "facebook/bart-base"
@@ -22,5 +21,5 @@ LOGGING_STEPS = 100
 
 # TDA options (only used when USE_TDA=True)
 FASTTEXT_DIM = 50
-LANDSCAPE_RESOLUTION = 100
-TDA_PCA_COMPONENTS = 10
+LANDSCAPE_RESOLUTION = 50
+TDA_PCA_COMPONENTS = 200
