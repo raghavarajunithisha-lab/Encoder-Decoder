@@ -18,7 +18,6 @@ from utils.tda_utils import (
 # model modules
 from models import bart_model, lstm_model, gru_model, t4_model
 
-from models.t4_model import Vocab, ChatDataset, collate_fn, train_t4
 from torch.utils.data import DataLoader
 import torch
 
@@ -91,9 +90,12 @@ def _ensure_tda_matrix(tda_like, target_dim):
 
 def prepare_and_train(cfg):
     set_seed(getattr(cfg, "SEED", 42))
-    # df = load_csv(cfg.CSV_PATH, cfg.INPUT_COL, cfg.OUTPUT_COL, max_examples=cfg.MAX_EXAMPLES)
 
-    df = load_csv(cfg.CSV_PATH, cfg.INPUT_COL, cfg.OUTPUT_COL)
+    # train.py (line 103)
+    df = load_csv(cfg.CSV_PATH, cfg.INPUT_COL, cfg.OUTPUT_COL, 
+              max_examples=getattr(cfg, "MAX_EXAMPLES", None))
+    # Insert this right after loading the CSV
+    df = df.sample(frac=1, random_state=getattr(cfg, "SEED", 42)).reset_index(drop=True)
 
     n = len(df)
     val_n = max(1, int(0.1 * n))
@@ -189,9 +191,12 @@ def prepare_and_train(cfg):
 
         trainer.train()
 
-        print("\n FINAL TEST EVALUATION")
-        trainer.evaluate(eval_dataset=tok_test, metric_key_prefix="test_eval")
-
+        print("\n FINAL TEST EVALUATION (BART)")
+        test_results = trainer.evaluate(eval_dataset=tok_test, metric_key_prefix="test")
+        print({
+            "test_loss": test_results.get("test_loss"), 
+            "test_bleu": test_results.get("test_bertscore_f1")
+        })
 
     elif model_name == "LSTM":
 
@@ -202,7 +207,7 @@ def prepare_and_train(cfg):
         )
 
         # pass TDA only if USE_TDA=True
-        train_ds = ChatDataset(
+        train_ds = lstm_model.ChatDataset(
             train_df[cfg.INPUT_COL].tolist(),
             train_df[cfg.OUTPUT_COL].tolist(),
             src_vocab,
@@ -210,7 +215,7 @@ def prepare_and_train(cfg):
             tda=tda_train if cfg.USE_TDA else None
         )
 
-        val_ds = ChatDataset(
+        val_ds = lstm_model.ChatDataset(
             val_df[cfg.INPUT_COL].tolist(),
             val_df[cfg.OUTPUT_COL].tolist(),
             src_vocab,
@@ -218,7 +223,7 @@ def prepare_and_train(cfg):
             tda=tda_val if cfg.USE_TDA else None
         )
 
-        test_ds = ChatDataset(
+        test_ds = lstm_model.ChatDataset(
             test_df[cfg.INPUT_COL].tolist(),
             test_df[cfg.OUTPUT_COL].tolist(),
             src_vocab,
@@ -230,22 +235,22 @@ def prepare_and_train(cfg):
             train_ds,
             batch_size=cfg.BATCH_SIZE,
             shuffle=True,
-            collate_fn=collate_fn
+            collate_fn=lstm_model.collate_fn
         )
         val_loader = DataLoader(
             val_ds,
             batch_size=cfg.BATCH_SIZE,
             shuffle=False,
-            collate_fn=collate_fn
+            collate_fn=lstm_model.collate_fn
         )
         test_loader = DataLoader(
             test_ds,
             batch_size=cfg.BATCH_SIZE,
             shuffle=False,
-            collate_fn=collate_fn
+            collate_fn=lstm_model.collate_fn
         )
 
-        result = train_lstm(
+        best = lstm_model.train_lstm(
             cfg,
             train_loader,
             val_loader,
@@ -255,24 +260,9 @@ def prepare_and_train(cfg):
             torch.device("cuda" if torch.cuda.is_available() else "cpu")
         )
 
-        print("\n LSTM TRAINING LOGS\n")
-
-        for row in result["history"]:
-            print(f"\nEpoch {row['epoch']}:")
-            print({
-                "train_loss": row["train_loss"],
-                "train_bleu": row["train_bleu"]
-            })
-            print({
-                "val_loss": row["val_loss"],
-                "val_bleu": row["val_bleu"]
-            })
-
-        print("\n FINAL LSTM RESULT")
-        print({
-            "test_loss": result["test_loss"],
-            "test_bleu": result["test_bleu"]
-        })
+        # In train.py under the LSTM section
+        print("\n FINAL TEST EVALUATION (LSTM)") 
+        print({"test_loss": best["test_loss"], "test_bleu": best["test_bleu"]})
 
 
     elif model_name == "GRU":
@@ -282,26 +272,25 @@ def prepare_and_train(cfg):
             cfg.MAX_VOCAB_SIZE, cfg.MIN_FREQ
         )
 
-        from models.gru_model import ChatDatasetPlain, collate_fn_plain, train_gru
 
         # Compute TDA features if requested (we already did above — tda_train/val/test available)
         # build datasets / loaders
         # PASS TDA arrays into the ChatDatasetPlain (only if cfg.USE_TDA is True)
-        train_ds = ChatDatasetPlain(
+        train_ds = gru_model.ChatDatasetPlain(
             train_df[cfg.INPUT_COL].tolist(),
             train_df[cfg.OUTPUT_COL].tolist(),
             src_vocab,
             tgt_vocab,
             tda=tda_train if cfg.USE_TDA else None
         )
-        val_ds = ChatDatasetPlain(
+        val_ds = gru_model.ChatDatasetPlain(
             val_df[cfg.INPUT_COL].tolist(),
             val_df[cfg.OUTPUT_COL].tolist(),
             src_vocab,
             tgt_vocab,
             tda=tda_val if cfg.USE_TDA else None
         )
-        test_ds = ChatDatasetPlain(
+        test_ds = gru_model.ChatDatasetPlain(
             test_df[cfg.INPUT_COL].tolist(),
             test_df[cfg.OUTPUT_COL].tolist(),
             src_vocab,
@@ -309,12 +298,12 @@ def prepare_and_train(cfg):
             tda=tda_test if cfg.USE_TDA else None
         )
 
-        train_loader = DataLoader(train_ds, batch_size=cfg.BATCH_SIZE, shuffle=True, collate_fn=collate_fn_plain)
-        val_loader   = DataLoader(val_ds,   batch_size=cfg.BATCH_SIZE, shuffle=False, collate_fn=collate_fn_plain)
-        test_loader  = DataLoader(test_ds,  batch_size=cfg.BATCH_SIZE, shuffle=False, collate_fn=collate_fn_plain)
+        train_loader = DataLoader(train_ds, batch_size=cfg.BATCH_SIZE, shuffle=True, collate_fn=gru_model.collate_fn_plain)
+        val_loader   = DataLoader(val_ds,   batch_size=cfg.BATCH_SIZE, shuffle=False, collate_fn=gru_model.collate_fn_plain)
+        test_loader  = DataLoader(test_ds,  batch_size=cfg.BATCH_SIZE, shuffle=False, collate_fn=gru_model.collate_fn_plain)
 
         # call train_gru with optional tda arrays (train_gru enables decoder TDA only if both cfg.USE_TDA and tda_train present)
-        result = train_gru(
+        result = gru_model.train_gru(
           cfg,
           train_loader,
           val_loader,
@@ -346,13 +335,13 @@ def prepare_and_train(cfg):
         # -------------------------
         # VOCABS
         # -------------------------
-        src_vocab = Vocab(
+        src_vocab = t4_model.Vocab(
             src_token_lists,
             min_freq=cfg.MIN_FREQ,
             max_size=cfg.MAX_VOCAB_SIZE
         )
 
-        tgt_vocab = Vocab(
+        tgt_vocab = t4_model.Vocab(
             tgt_token_lists,
             min_freq=cfg.MIN_FREQ,
             max_size=cfg.MAX_VOCAB_SIZE
@@ -361,7 +350,7 @@ def prepare_and_train(cfg):
         # -------------------------
         # DATASETS
         # -------------------------
-        train_ds = ChatDataset(
+        train_ds = t4_model.ChatDataset(
             train_df[cfg.INPUT_COL].tolist(),
             train_df[cfg.OUTPUT_COL].tolist(),
             src_vocab,
@@ -369,7 +358,7 @@ def prepare_and_train(cfg):
             tda=tda_train if cfg.USE_TDA else None
         )
 
-        val_ds = ChatDataset(
+        val_ds = t4_model.ChatDataset(
             val_df[cfg.INPUT_COL].tolist(),
             val_df[cfg.OUTPUT_COL].tolist(),
             src_vocab,
@@ -377,7 +366,7 @@ def prepare_and_train(cfg):
             tda=tda_val if cfg.USE_TDA else None
         )
 
-        test_ds = ChatDataset(
+        test_ds = t4_model.ChatDataset(
             test_df[cfg.INPUT_COL].tolist(),
             test_df[cfg.OUTPUT_COL].tolist(),
             src_vocab,
@@ -392,27 +381,27 @@ def prepare_and_train(cfg):
             train_ds,
             batch_size=cfg.BATCH_SIZE,
             shuffle=True,
-            collate_fn=collate_fn
+            collate_fn=t4_model.collate_fn
         )
 
         val_loader = DataLoader(
             val_ds,
             batch_size=cfg.BATCH_SIZE,
             shuffle=False,
-            collate_fn=collate_fn
+            collate_fn=t4_model.collate_fn
         )
 
         test_loader = DataLoader(
             test_ds,
             batch_size=1,   # decoding is easier & correct with batch=1
             shuffle=False,
-            collate_fn=collate_fn
+            collate_fn=t4_model.collate_fn
         )
 
         # -------------------------
         # TRAIN
         # -------------------------
-        best = train_t4(
+        best = t4_model.train_t4(
             cfg,
             train_loader,
             val_loader,

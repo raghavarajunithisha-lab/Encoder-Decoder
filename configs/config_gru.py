@@ -1,6 +1,6 @@
 # config_gru.py
 MODEL_NAME = "GRU"
-USE_TDA = False   
+USE_TDA = True   
 
 # ------------------ Data ------------------
 CSV_PATH = "data/preprocessed_counselchat_data_df.csv"
@@ -18,7 +18,7 @@ MIN_FREQ = 1
 
 # ------------------ Training ------------------
 BATCH_SIZE = 8
-NUM_EPOCHS = 15
+NUM_EPOCHS = 100
 LEARNING_RATE = 1e-3
 TEACHER_FORCING_RATIO = 0.5
 MAX_OUTPUT_LEN = 100
@@ -28,4 +28,4 @@ SEED = 42
 # ------------------ TDA OPTIONS (Only if USE_TDA=True) ------------------
 FASTTEXT_DIM = 50
 LANDSCAPE_RESOLUTION = 100
-TDA_PCA_COMPONENTS = 200
+TDA_PCA_COMPONENTS = 250

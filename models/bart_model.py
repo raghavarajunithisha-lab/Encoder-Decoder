@@ -21,61 +21,51 @@ from transformers import EarlyStoppingCallback
 
 
 def prepare_tokenized_datasets(df, cfg, tda_array=None):
-    """
-    Tokenize a single DataFrame (no internal train/test split).
-    If tda_array is provided (list/np.array of shape (N, tda_dim)),
-    it will be attached to the returned HF Dataset as column 'tda'
-    so Trainer batches will contain the tda vectors.
-    Returns: tokenizer, tokenized_dataset, data_collator
-    """
     tokenizer = BartTokenizerFast.from_pretrained(cfg.BART_MODEL_NAME)
     ds = Dataset.from_pandas(df)
 
     def preprocess_function(examples):
-        inputs = tokenizer(
+        # Tokenize Inputs
+        model_inputs = tokenizer(
             examples[cfg.INPUT_COL],
             max_length=cfg.MAX_INPUT_LEN,
             truncation=True,
             padding="max_length",
         )
-        with tokenizer.as_target_tokenizer():
-            labels = tokenizer(
-                examples[cfg.OUTPUT_COL],
-                max_length=cfg.MAX_TARGET_LEN,
-                truncation=True,
-                padding="max_length",
-            )
+        
+        # FIXED: Tokenize Labels without as_target_tokenizer
+        labels = tokenizer(
+            text_target=examples[cfg.OUTPUT_COL], # Use text_target argument
+            max_length=cfg.MAX_TARGET_LEN,
+            truncation=True,
+            padding="max_length",
+        )
+
         # Replace padding token IDs with -100 for loss masking
         labels["input_ids"] = [
             [(label if label != tokenizer.pad_token_id else -100) for label in labels_seq]
             for labels_seq in labels["input_ids"]
         ]
-        inputs["labels"] = labels["input_ids"]
-        return inputs
+        model_inputs["labels"] = labels["input_ids"]
+        return model_inputs
 
     tokenized = ds.map(preprocess_function, batched=True)
 
-    # If user passed tda_array (numpy/list), attach it to the HF Dataset under column 'tda'.
-    # Ensure correct length and types.
     if tda_array is not None:
         import numpy as _np
-
         tda_mat = _np.asarray(tda_array)
         if tda_mat.shape[0] != len(tokenized):
-            # If lengths mismatch, try to handle gracefully by trunc/pad with zeros
             desired = len(tokenized)
             if tda_mat.shape[0] < desired:
                 pad = _np.zeros((desired - tda_mat.shape[0], tda_mat.shape[1]), dtype=np.float32)
                 tda_mat = _np.vstack([tda_mat, pad])
             else:
                 tda_mat = tda_mat[:desired]
-        # Convert rows to python lists so HF Dataset can store them
         tda_list = [list(row.astype(float)) for row in tda_mat]
         tokenized = tokenized.add_column("tda", tda_list)
 
     data_collator = DataCollatorForSeq2Seq(tokenizer)
     return tokenizer, tokenized, data_collator
-
 
 def build_model(cfg):
     # Build the base BART model and — if USE_TDA — attach a learned projection for TDA
@@ -96,7 +86,7 @@ def build_model(cfg):
 
 
 class EpochEvalCallback(TrainerCallback):
-    """ Prints ONLY: epoch N: {train_eval_dict} {val_eval_dict} """
+    """ Prints metrics in the exact requested format """
 
     def __init__(self, train_dataset, val_dataset):
         self.train_dataset = train_dataset
@@ -107,19 +97,16 @@ class EpochEvalCallback(TrainerCallback):
         trainer = kwargs.get("trainer", None) or self.trainer_ref
         if trainer is None:
             return
+        
         epoch_num = int(state.epoch)
-        # PRINT EXACT FORMAT YOU REQUESTED
-        print(f"\nepoch {epoch_num} :")
-        # ---- TRAIN EVAL ----
-        train_metrics = trainer.evaluate(
-            eval_dataset=self.train_dataset, metric_key_prefix="train_eval"
-        )
-        # ---- VAL EVAL ----
-        val_metrics = trainer.evaluate(eval_dataset=self.val_dataset, metric_key_prefix="val_eval")
-        # Print metrics exactly as requested (callbacks may compute and return dicts,
-        # the evaluate call already prints due to trainer settings disabled; we just print here)
-        # Note: The trainer.evaluate calls will return dicts that include loss/metrics; printing is handled by the user request
-        # We do not reformat those dicts beyond the prints above.
+        
+        # Perform Evaluation
+        train_metrics = trainer.evaluate(eval_dataset=self.train_dataset, metric_key_prefix="train")
+        val_metrics = trainer.evaluate(eval_dataset=self.val_dataset, metric_key_prefix="val")
+
+      
+        print(f"\nEpoch {epoch_num}:")
+       
 
 
 def get_trainer(model, tokenizer, train_dataset, eval_dataset, test_dataset, data_collator, cfg):
@@ -141,10 +128,13 @@ def get_trainer(model, tokenizer, train_dataset, eval_dataset, test_dataset, dat
 
     training_args = Seq2SeqTrainingArguments(
         output_dir=cfg.OUTPUT_DIR,
-        eval_strategy="epoch",
-        logging_strategy="epoch",
+        # FIXED: Must match save_strategy ("epoch") to use load_best_model_at_end
+        eval_strategy="epoch",       
+        # FIXED: Use "no" (not "none") to keep the console clean
+        logging_strategy="no",       
         save_strategy="epoch",        
         load_best_model_at_end=True,
+        # metric_for_best_model="eval_loss", # Optional: defaults to loss
         greater_is_better=False,   
         learning_rate=cfg.LEARNING_RATE,
         per_device_train_batch_size=cfg.BATCH_SIZE,
@@ -153,8 +143,8 @@ def get_trainer(model, tokenizer, train_dataset, eval_dataset, test_dataset, dat
         weight_decay=0.01,
         predict_with_generate=True,
         generation_max_length=150,
-        report_to="none",
-        disable_tqdm=True,  
+        report_to="none",          
+        disable_tqdm=True,         
     )
 
     # If model.use_tda is True we need the Trainer to pass 'tda' from batch to model.forward.
@@ -211,7 +201,6 @@ def get_trainer(model, tokenizer, train_dataset, eval_dataset, test_dataset, dat
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        tokenizer=tokenizer,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
         callbacks=[early_stopping]
