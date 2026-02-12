@@ -5,7 +5,7 @@ USE_TDA = False
 CSV_PATH = "data/preprocessed_mental_health_chatbot.csv"
 INPUT_COL = "human_input"
 OUTPUT_COL = "assistant_output"
-MAX_EXAMPLES = 50
+MAX_EXAMPLES = None
 
 # training
 BART_MODEL_NAME = "facebook/bart-base"
@@ -21,4 +21,4 @@ LOGGING_STEPS = 100
 # TDA options (only used when USE_TDA=True)
 FASTTEXT_DIM = 50
 LANDSCAPE_RESOLUTION = 50
-TDA_PCA_COMPONENTS = 30
+TDA_PCA_COMPONENTS = 250
