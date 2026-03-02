@@ -108,10 +108,10 @@ def diagrams_to_landscape_vectors(
     vectors = []
     for diag in diagrams:
         try:
-            D = selector(diag)
-            D = scaler_diag(D)
-            D = clamper(D)
-            L = landscape(D)
+            D = selector.fit_transform([diag])
+            D = scaler_diag.fit_transform(D)
+            D = clamper.fit_transform(D)
+            L = landscape.fit_transform(D)[0]
             vectors.append(np.array(L).flatten())
         except Exception:
             vectors.append(np.zeros(resolution))
