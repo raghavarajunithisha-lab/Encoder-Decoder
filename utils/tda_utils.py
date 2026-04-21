@@ -45,6 +45,7 @@ def train_fasttext(tokenized_sentences, vec_size=100, epochs=10):
         min_count=1,
         workers=4,
         epochs=epochs,
+        bucket=50000,
     )
     return model
 
@@ -52,10 +53,14 @@ def train_fasttext(tokenized_sentences, vec_size=100, epochs=10):
 # -------------------------
 # PERSISTENCE DIAGRAM
 # -------------------------
-def sentence_diagram_from_embeddings(embeddings, quantile=0.9):
+def sentence_diagram_from_embeddings(embeddings, quantile=0.9, max_tokens=100):
     # embeddings: (n_tokens, dim)
     if embeddings.size == 0:
         return np.zeros((0, 2))
+
+    # Cap number of tokens to prevent OOM in Gudhi for very long texts
+    if embeddings.shape[0] > max_tokens:
+        embeddings = embeddings[:max_tokens]
 
     try:
         dists = np.linalg.norm(
@@ -91,6 +96,7 @@ def diagrams_to_landscape_vectors(
     pca_dim=10,
     pca_model=None,
     scaler=None,
+    texts=None
 ):
     libs = safe_imports()
     DiagramSelector = libs["DiagramSelector"]
@@ -105,16 +111,53 @@ def diagrams_to_landscape_vectors(
     clamper = Clamping()
     landscape = Landscape(resolution=resolution)
 
+    import warnings
+
     vectors = []
+    
+    # We first try to get an exact length for zero arrays based on a non-empty diagram.
+    # The length depends on landscape configuration, scaling, etc.
+    # Often it is (number_of_landscapes * resolution) which gudhi dynamically creates.
+    # If all fail, we will fallback to resolution and hope the downstream handles it.
+    target_length = None
     for diag in diagrams:
+        if len(diag) > 0:
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    D = selector.fit_transform([diag])
+                    D = scaler_diag.fit_transform(D)
+                    D = clamper.fit_transform(D)
+                    L = landscape.fit_transform(D)[0]
+                    target_length = len(np.array(L).flatten())
+                    break
+            except Exception:
+                pass
+    
+    if target_length is None:
+        target_length = resolution
+
+    for idx, diag in enumerate(diagrams):
+        if len(diag) == 0:
+            if texts is not None and idx < len(texts):
+                print(f"Empty diagram for: {repr(texts[idx])}")
+            vectors.append(np.zeros(target_length))
+            continue
         try:
-            D = selector.fit_transform([diag])
-            D = scaler_diag.fit_transform(D)
-            D = clamper.fit_transform(D)
-            L = landscape.fit_transform(D)[0]
-            vectors.append(np.array(L).flatten())
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                D = selector.fit_transform([diag])
+                D = scaler_diag.fit_transform(D)
+                D = clamper.fit_transform(D)
+                L = landscape.fit_transform(D)[0]
+                
+                arr = np.array(L).flatten()
+                if len(arr) != target_length:
+                    arr = pad_or_truncate(arr, target_length)
+                
+                vectors.append(arr)
         except Exception:
-            vectors.append(np.zeros(resolution))
+            vectors.append(np.zeros(target_length))
 
     tda_features = np.vstack(vectors).astype(float)
 
