@@ -54,20 +54,20 @@ class Encoder(nn.Module):
     def __init__(self, vocab_size, embed_size, hidden_size, tda_dim=None):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_size, padding_idx=0)
-        self.lstm = nn.LSTM(embed_size, hidden_size, batch_first=True, bidirectional=True)
+        actual_embed_size = embed_size + (tda_dim if tda_dim else 0)
+        self.lstm = nn.LSTM(actual_embed_size, hidden_size, batch_first=True, bidirectional=True)
         self.fc = nn.Linear(hidden_size * 2, hidden_size)
-        self.use_tda = tda_dim is not None
-        if self.use_tda:
-            self.tda_proj = nn.Linear(tda_dim, hidden_size)
 
     def forward(self, x, lens, tda=None):
         emb = self.embedding(x)
+        if tda is not None:
+            tda_expanded = tda.unsqueeze(1).expand(-1, x.size(1), -1)
+            emb = torch.cat([emb, tda_expanded], dim=-1)
+            
         packed = nn.utils.rnn.pack_padded_sequence(emb, lens.cpu(), batch_first=True, enforce_sorted=False)
         _, (h, _) = self.lstm(packed)
         h_cat = torch.cat([h[-2], h[-1]], dim=1)
         h0 = self.fc(h_cat)
-        if self.use_tda and tda is not None:
-            h0 = h0 + self.tda_proj(tda)
         h0 = h0.unsqueeze(0)
         return (h0, torch.zeros_like(h0))
 
@@ -128,12 +128,13 @@ def train_lstm(cfg, train_loader, val_loader, test_loader, src_vocab, tgt_vocab,
     best_bleu, counter, patience = 0.0, 0, 3
     history = []
 
+    from tqdm import tqdm
     for epoch in range(cfg.NUM_EPOCHS):
         encoder.train()
         decoder.train()
         epoch_loss = 0
 
-        for src, lens, tgt, tda in train_loader:
+        for src, lens, tgt, tda in tqdm(train_loader, desc=f"Epoch {epoch+1}/{cfg.NUM_EPOCHS} Training", disable=True):
             src, tgt, lens = src.to(device), tgt.to(device), lens.to(device)
             tda = tda.to(device) if tda is not None else None
             opt_e.zero_grad(); opt_d.zero_grad()
@@ -166,6 +167,7 @@ def train_lstm(cfg, train_loader, val_loader, test_loader, src_vocab, tgt_vocab,
 
     checkpoint = torch.load("best_lstm.pth")
     encoder.load_state_dict(checkpoint['encoder']); decoder.load_state_dict(checkpoint['decoder'])
+    import os; os.remove("best_lstm.pth")  # delete to free disk space
     test_bleu, test_loss = run_evaluation(encoder, decoder, test_loader, tgt_vocab, device, loss_fn)
 
     return {"history": history, "best_bleu": best_bleu, "test_loss": test_loss, "test_bleu": test_bleu}

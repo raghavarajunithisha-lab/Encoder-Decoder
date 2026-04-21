@@ -13,6 +13,11 @@ from transformers import (
     Seq2SeqTrainingArguments,
     DataCollatorForSeq2Seq,
 )
+
+from transformers import logging as hf_logging
+hf_logging.set_verbosity_error()
+hf_logging.disable_progress_bar()
+
 from evaluate import load as load_metric
 from transformers import TrainerCallback
 
@@ -100,13 +105,13 @@ class EpochEvalCallback(TrainerCallback):
         
         epoch_num = int(state.epoch)
         
-        # Perform Evaluation
-        train_metrics = trainer.evaluate(eval_dataset=self.train_dataset, metric_key_prefix="train")
-        val_metrics = trainer.evaluate(eval_dataset=self.val_dataset, metric_key_prefix="val")
-
-      
-        print(f"\nEpoch {epoch_num}:")
-       
+        # Get the latest train loss from trainer logs
+        logs = state.log_history
+        train_loss = next((log.get("loss") for log in reversed(logs) if "loss" in log), None)
+        
+        print(f"\nEpoch {epoch_num} finished. Avg Train Loss: {train_loss}")
+        # We DO NOT call trainer.evaluate(train_dataset) here! It would take ~1 hour per epoch to generate 12k responses.
+        # Val evaluation is automatically handled by Trainer's config.
 
 
 def get_trainer(model, tokenizer, train_dataset, eval_dataset, test_dataset, data_collator, cfg):
@@ -128,14 +133,11 @@ def get_trainer(model, tokenizer, train_dataset, eval_dataset, test_dataset, dat
 
     training_args = Seq2SeqTrainingArguments(
         output_dir=cfg.OUTPUT_DIR,
-        # FIXED: Must match save_strategy ("epoch") to use load_best_model_at_end
-        eval_strategy="epoch",       
-        # FIXED: Use "no" (not "none") to keep the console clean
-        logging_strategy="no",       
-        save_strategy="epoch",        
-        load_best_model_at_end=True,
-        # metric_for_best_model="eval_loss", # Optional: defaults to loss
-        greater_is_better=False,   
+        eval_strategy="epoch",
+        logging_strategy="epoch",
+        save_strategy="no",           # Do NOT save checkpoints — saves disk space
+        load_best_model_at_end=False, # Cannot be True when save_strategy="no"
+        greater_is_better=False,
         learning_rate=cfg.LEARNING_RATE,
         per_device_train_batch_size=cfg.BATCH_SIZE,
         per_device_eval_batch_size=cfg.BATCH_SIZE,
@@ -143,8 +145,8 @@ def get_trainer(model, tokenizer, train_dataset, eval_dataset, test_dataset, dat
         weight_decay=0.01,
         predict_with_generate=True,
         generation_max_length=150,
-        report_to="none",          
-        disable_tqdm=True,         
+        report_to="none",
+        disable_tqdm=True,
     )
 
     # If model.use_tda is True we need the Trainer to pass 'tda' from batch to model.forward.
@@ -196,7 +198,18 @@ def get_trainer(model, tokenizer, train_dataset, eval_dataset, test_dataset, dat
 
     early_stopping = EarlyStoppingCallbackCustom(patience=3,delta=0.0)
 
-    trainer = Seq2SeqTrainer(
+    class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+        def create_optimizer(self):
+            if self.optimizer is None:
+                self.optimizer = torch.optim.AdamW(
+                    self.model.parameters(),
+                    lr=self.args.learning_rate,
+                    weight_decay=self.args.weight_decay,
+                    # explicitly leaving fused=False (default) to avoid XLA error
+                )
+            return self.optimizer
+
+    trainer = CustomSeq2SeqTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,

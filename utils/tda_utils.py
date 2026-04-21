@@ -120,7 +120,7 @@ def diagrams_to_landscape_vectors(
 
     # PCA
     if pca_model is None:
-        pca_model = PCA(n_components=min(pca_dim, tda_features.shape[1]))
+        pca_model = PCA(n_components=min(pca_dim, tda_features.shape[0], tda_features.shape[1]))
         tda_pca = pca_model.fit_transform(tda_features)
     else:
         tda_pca = pca_model.transform(tda_features)

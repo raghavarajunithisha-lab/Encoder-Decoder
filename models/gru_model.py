@@ -104,14 +104,18 @@ def collate_fn_plain(batch):
 # ------------------ MODEL ------------------
 
 class Encoder(nn.Module):
-    def __init__(self, vocab_size, embed_size, hidden_size):
+    def __init__(self, vocab_size, embed_size, hidden_size, tda_dim=0):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_size, padding_idx=0)
-        self.gru = nn.GRU(embed_size, hidden_size, bidirectional=True, batch_first=True)
+        actual_embed_size = embed_size + tda_dim
+        self.gru = nn.GRU(actual_embed_size, hidden_size, bidirectional=True, batch_first=True)
         self.fc = nn.Linear(hidden_size * 2, hidden_size)
 
-    def forward(self, x, lengths):
+    def forward(self, x, lengths, tda=None):
         emb = self.embedding(x)
+        if tda is not None:
+             tda_expanded = tda.unsqueeze(1).expand(-1, x.size(1), -1)
+             emb = torch.cat([emb, tda_expanded], dim=-1)
         packed = nn.utils.rnn.pack_padded_sequence(
             emb, lengths.cpu(), batch_first=True, enforce_sorted=False
         )
@@ -136,23 +140,16 @@ class Attention(nn.Module):
         return ctx
 
 class Decoder(nn.Module):
-    def __init__(self, vocab_size, embed_size, enc_dim, dec_dim, use_tda=False, tda_dim=0):
+    def __init__(self, vocab_size, embed_size, enc_dim, dec_dim):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_size, padding_idx=0)
         self.gru = nn.GRU(embed_size + enc_dim, dec_dim, batch_first=True)
         self.attn = Attention(enc_dim, dec_dim)
         self.fc = nn.Linear(dec_dim + enc_dim + embed_size, vocab_size)
 
-        self.use_tda = use_tda and tda_dim > 0
-        if self.use_tda:
-            self.tda_proj = nn.Linear(tda_dim, enc_dim)
-
-    def forward(self, inp, h, enc_out, mask, tda_context=None):
+    def forward(self, inp, h, enc_out, mask):
         emb = self.embedding(inp).unsqueeze(1)
         ctx = self.attn(h[-1], enc_out, mask)
-
-        if self.use_tda and tda_context is not None:
-            ctx = ctx + self.tda_proj(tda_context)
 
         x = torch.cat((emb, ctx.unsqueeze(1)), dim=2)
         out, h = self.gru(x, h)
@@ -180,9 +177,8 @@ def train_gru(cfg, train_loader, val_loader, test_loader,
                 tda_dim = batch[-1].shape[1]
             break
 
-    encoder = Encoder(len(src_vocab.token2idx), cfg.EMBED_SIZE, cfg.HIDDEN_SIZE).to(device)
-    decoder = Decoder(len(tgt_vocab.token2idx), cfg.EMBED_SIZE, enc_dim,
-                      cfg.HIDDEN_SIZE, decoder_use_tda, tda_dim).to(device)
+    encoder = Encoder(len(src_vocab.token2idx), cfg.EMBED_SIZE, cfg.HIDDEN_SIZE, tda_dim).to(device)
+    decoder = Decoder(len(tgt_vocab.token2idx), cfg.EMBED_SIZE, enc_dim, cfg.HIDDEN_SIZE).to(device)
 
     opt_e = torch.optim.Adam(encoder.parameters(), lr=cfg.LEARNING_RATE)
     opt_d = torch.optim.Adam(decoder.parameters(), lr=cfg.LEARNING_RATE)
@@ -198,7 +194,7 @@ def train_gru(cfg, train_loader, val_loader, test_loader,
         preds = [[] for _ in range(batch_size)]
 
         for _ in range(max_len):
-            out, h = decoder(x, h, enc_out, mask, tda_batch)
+            out, h = decoder(x, h, enc_out, mask)
             x = out.argmax(1)
             for i in range(batch_size):
                 preds[i].append(x[i].item())
@@ -217,8 +213,9 @@ def train_gru(cfg, train_loader, val_loader, test_loader,
         preds, refs = [], []
         total_loss, total_ex = 0.0, 0
 
+        from tqdm import tqdm
         with torch.no_grad():
-            for data in loader:
+            for data in tqdm(loader, desc="Evaluating", disable=True):
                 if decoder_use_tda and len(data) == 5:
                     src, src_lens, tgt, tgt_lens, tda = data
                     tda = tda.to(device)
@@ -227,18 +224,18 @@ def train_gru(cfg, train_loader, val_loader, test_loader,
                     tda = None
 
                 src, tgt = src.to(device), tgt.to(device)
-                enc_out, h = encoder(src, src_lens.to(device))
+                enc_out, h = encoder(src, src_lens.to(device), tda)
                 mask = create_masks(src)
 
                 x = tgt[:, 0]
                 for t in range(1, tgt.size(1)):
-                    out, h = decoder(x, h, enc_out, mask, tda)
+                    out, h = decoder(x, h, enc_out, mask)
                     total_loss += crit(out, tgt[:, t]).item()
                     x = tgt[:, t]
 
                 total_ex += src.size(0)
 
-                enc_out2, h2 = encoder(src, src_lens.to(device))
+                enc_out2, h2 = encoder(src, src_lens.to(device), tda)
                 batch_preds = greedy_decode(enc_out2, h2, mask, cfg.MAX_OUTPUT_LEN, tda)
 
                 for j in range(src.size(0)):
@@ -256,7 +253,8 @@ def train_gru(cfg, train_loader, val_loader, test_loader,
         encoder.train()
         decoder.train()
 
-        for data in train_loader:
+        from tqdm import tqdm
+        for data in tqdm(train_loader, desc=f"Epoch {epoch}/{cfg.NUM_EPOCHS} Training", disable=True):
             if decoder_use_tda and len(data) == 5:
                 src, src_lens, tgt, tgt_lens, tda = data
                 tda = tda.to(device)
@@ -268,13 +266,13 @@ def train_gru(cfg, train_loader, val_loader, test_loader,
             opt_e.zero_grad()
             opt_d.zero_grad()
 
-            enc_out, h = encoder(src, src_lens.to(device))
+            enc_out, h = encoder(src, src_lens.to(device), tda)
             mask = create_masks(src)
 
             x = tgt[:, 0]
             loss = 0.0
             for t in range(1, tgt.size(1)):
-                out, h = decoder(x, h, enc_out, mask, tda)
+                out, h = decoder(x, h, enc_out, mask)
                 loss += crit(out, tgt[:, t])
                 x = tgt[:, t] if random.random() < cfg.TEACHER_FORCING_RATIO else out.argmax(1)
 
@@ -305,6 +303,7 @@ def train_gru(cfg, train_loader, val_loader, test_loader,
     ckpt = torch.load("best_gru.pth", map_location=device)
     encoder.load_state_dict(ckpt["encoder"])
     decoder.load_state_dict(ckpt["decoder"])
+    import os; os.remove("best_gru.pth")  # delete to free disk space
 
     test_loss, test_bleu = evaluate(test_loader)
 

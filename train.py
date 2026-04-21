@@ -3,9 +3,16 @@
 
 import os
 import random
+from tqdm import tqdm
+
+_TDA_CACHE = {}
+
 import numpy as np
 import torch
-
+import pickle
+import multiprocessing
+import os
+from functools import partial
 from utils.data_utils import load_csv, SimpleVocab
 from torch.utils.data import DataLoader
 from utils.tda_utils import (
@@ -113,59 +120,89 @@ def prepare_and_train(cfg):
     tda_test = None
 
     if getattr(cfg, "USE_TDA", False):
-        print("Computing TDA features (this may be slow)...")
+        # Create a unique cache filename based on CSV, seed, limits, and PCA dim
+        pca_dim = getattr(cfg, 'TDA_PCA_COMPONENTS', getattr(cfg, 'TDA_PCA_DIM', 10))
+        cache_filename = f"{cfg.CSV_PATH}.max{getattr(cfg, 'MAX_EXAMPLES', 'all')}.seed{getattr(cfg, 'SEED', 42)}.pca{pca_dim}.tda.pkl".replace('/', '_').replace('\\', '_')
+        cache_path = os.path.join("data", cache_filename)
+        
+        if os.path.exists(cache_path):
+            print(f"Loading cached TDA features from disk: {cache_path}...")
+            with open(cache_path, "rb") as f:
+                tda_train, tda_val, tda_test = pickle.load(f)
+        else:
+            print("Computing TDA features (using multiprocessing, will be cached to disk)...")
 
-        # Train FastText only on training sentences
-        tokenized_train = [s.strip().split() for s in train_df[cfg.INPUT_COL].astype(str).tolist()]
-        ft = train_fasttext(tokenized_train, vec_size=getattr(cfg, "FASTTEXT_DIM", getattr(cfg, "FASTTEXT_VEC_SIZE", 100)))
+            # Train FastText only on training sentences
+            tokenized_train = [s.strip().split()[:100] for s in train_df[cfg.INPUT_COL].astype(str).tolist()]
+            ft = train_fasttext(tokenized_train, vec_size=getattr(cfg, "FASTTEXT_DIM", getattr(cfg, "FASTTEXT_VEC_SIZE", 100)))
 
-        # Build embeddings utility function
-        def build_embeddings(data):
-            embeddings = []
-            for s in data:
-                tokens = s.strip().split()
-                vecs = []
-                for tok in tokens:
-                    try:
-                        vecs.append(ft.wv[tok])
-                    except Exception:
-                        vecs.append(np.zeros(ft.vector_size))
-                if len(vecs) == 0:
-                    vecs = np.zeros((1, ft.vector_size))
-                embeddings.append(np.array(vecs))
-            return embeddings
+            # Build embeddings utility function
+            def build_embeddings(data):
+                embeddings = []
+                for s in tqdm(data, desc="Building Embeddings", leave=False, disable=True):
+                    tokens = s.strip().split()[:100]
+                    vecs = []
+                    for tok in tokens:
+                        try:
+                            vecs.append(ft.wv[tok])
+                        except Exception:
+                            vecs.append(np.zeros(ft.vector_size))
+                    if len(vecs) == 0:
+                        vecs = np.zeros((1, ft.vector_size))
+                    embeddings.append(np.array(vecs))
+                return embeddings
 
-        # Train diagrams and PCA on train set
-        train_diagrams = [sentence_diagram_from_embeddings(emb) for emb in build_embeddings(train_df[cfg.INPUT_COL].tolist())]
+            # Thread-pool for TDA Diagrams (avoids heavy re-imports from multiprocessing)
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            def process_diagrams(embeddings_list, desc="Diagrams"):
+                results = [None] * len(embeddings_list)
+                with ThreadPoolExecutor() as executor:
+                    futures = {executor.submit(sentence_diagram_from_embeddings, emb): i for i, emb in enumerate(embeddings_list)}
+                    for f in tqdm(as_completed(futures), total=len(futures), desc=desc, disable=True):
+                        results[futures[f]] = f.result()
+                return results
 
-        tda_train_raw, pca_model, scaler = diagrams_to_landscape_vectors(
-            train_diagrams,
-            resolution=getattr(cfg, "LANDSCAPE_RESOLUTION", getattr(cfg, "TDA_LANDSCAPE_RESOLUTION", 200)),
-            pca_dim=getattr(cfg, "TDA_PCA_COMPONENTS", getattr(cfg, "TDA_PCA_DIM", 10))
-        )
+            # Train diagrams and PCA on train set
+            train_diagrams = process_diagrams(build_embeddings(train_df[cfg.INPUT_COL].tolist()), desc="TDA Train Diagrams (Multi-core)")
 
-        # transform val and test using pca_model + scaler
-        val_diagrams = [sentence_diagram_from_embeddings(emb) for emb in build_embeddings(val_df[cfg.INPUT_COL].tolist())]
-        tda_val_raw, _, _ = diagrams_to_landscape_vectors(
-            val_diagrams,
-            resolution=getattr(cfg, "LANDSCAPE_RESOLUTION", getattr(cfg, "TDA_LANDSCAPE_RESOLUTION", 200)),
-            pca_model=pca_model,
-            scaler=scaler
-        )
+            tda_train_raw, pca_model, scaler = diagrams_to_landscape_vectors(
+                train_diagrams,
+                resolution=getattr(cfg, "LANDSCAPE_RESOLUTION", getattr(cfg, "TDA_LANDSCAPE_RESOLUTION", 200)),
+                pca_dim=getattr(cfg, "TDA_PCA_COMPONENTS", getattr(cfg, "TDA_PCA_DIM", 10))
+            )
 
-        test_diagrams = [sentence_diagram_from_embeddings(emb) for emb in build_embeddings(test_df[cfg.INPUT_COL].tolist())]
-        tda_test_raw, _, _ = diagrams_to_landscape_vectors(
-            test_diagrams,
-            resolution=getattr(cfg, "LANDSCAPE_RESOLUTION", getattr(cfg, "TDA_LANDSCAPE_RESOLUTION", 200)),
-            pca_model=pca_model,
-            scaler=scaler
-        )
+            # transform val and test using pca_model + scaler
+            val_diagrams = process_diagrams(build_embeddings(val_df[cfg.INPUT_COL].tolist()), desc="TDA Val Diagrams (Multi-core)")
+            tda_val_raw, _, _ = diagrams_to_landscape_vectors(
+                val_diagrams,
+                resolution=getattr(cfg, "LANDSCAPE_RESOLUTION", getattr(cfg, "TDA_LANDSCAPE_RESOLUTION", 200)),
+                pca_model=pca_model,
+                scaler=scaler
+            )
 
-        # Ensure numeric 2D arrays with consistent final dimension = TDA_PCA_COMPONENTS
-        tda_dim = getattr(cfg, "TDA_PCA_COMPONENTS", getattr(cfg, "TDA_PCA_DIM", 10))
-        tda_train = _ensure_tda_matrix(tda_train_raw, tda_dim)
-        tda_val   = _ensure_tda_matrix(tda_val_raw, tda_dim)
-        tda_test  = _ensure_tda_matrix(tda_test_raw, tda_dim)
+            test_diagrams = process_diagrams(build_embeddings(test_df[cfg.INPUT_COL].tolist()), desc="TDA Test Diagrams (Multi-core)")
+            tda_test_raw, _, _ = diagrams_to_landscape_vectors(
+                test_diagrams,
+                resolution=getattr(cfg, "LANDSCAPE_RESOLUTION", getattr(cfg, "TDA_LANDSCAPE_RESOLUTION", 200)),
+                pca_model=pca_model,
+                scaler=scaler
+            )
+
+            # Ensure numeric 2D arrays with consistent final dimension = TDA_PCA_COMPONENTS
+            tda_dim = getattr(cfg, "TDA_PCA_COMPONENTS", getattr(cfg, "TDA_PCA_DIM", 10))
+            tda_train = _ensure_tda_matrix(tda_train_raw, tda_dim)
+            tda_val   = _ensure_tda_matrix(tda_val_raw, tda_dim)
+            tda_test  = _ensure_tda_matrix(tda_test_raw, tda_dim)
+            
+            # Save to disk
+            tda_tuple = (tda_train, tda_val, tda_test)
+            try:
+                os.makedirs("data", exist_ok=True)
+                with open(cache_path, "wb") as f:
+                    pickle.dump(tda_tuple, f)
+                print(f"Saved TDA cache to {cache_path}")
+            except Exception as e:
+                print(f"Warning: could not save TDA cache: {e}")
 
     # ---------- MODEL TRAINING ----------
     model_name = getattr(cfg, "MODEL_NAME", None)
@@ -193,10 +230,12 @@ def prepare_and_train(cfg):
 
         print("\n FINAL TEST EVALUATION (BART)")
         test_results = trainer.evaluate(eval_dataset=tok_test, metric_key_prefix="test")
-        print({
-            "test_loss": test_results.get("test_loss"), 
+        result_dict = {
+            "test_loss": test_results.get("test_loss"),
             "test_bleu": test_results.get("test_bertscore_f1")
-        })
+        }
+        print(result_dict)
+        return result_dict
 
     elif model_name == "LSTM":
 
@@ -260,9 +299,10 @@ def prepare_and_train(cfg):
             torch.device("cuda" if torch.cuda.is_available() else "cpu")
         )
 
-        # In train.py under the LSTM section
-        print("\n FINAL TEST EVALUATION (LSTM)") 
-        print({"test_loss": best["test_loss"], "test_bleu": best["test_bleu"]})
+        print("\n FINAL TEST EVALUATION (LSTM)")
+        result_dict = {"test_loss": best["test_loss"], "test_bleu": best["test_bleu"]}
+        print(result_dict)
+        return result_dict
 
 
     elif model_name == "GRU":
@@ -314,8 +354,9 @@ def prepare_and_train(cfg):
 
 
         print("\n FINAL TEST EVALUATION (GRU)")
-        # print both test_loss and test_bleu as requested
-        print({"test_loss": result.get("test_loss"), "test_bleu": result["test_bleu"]})
+        result_dict = {"test_loss": result.get("test_loss"), "test_bleu": result["test_bleu"]}
+        print(result_dict)
+        return result_dict
 
     elif model_name == "T4":
 
@@ -415,10 +456,12 @@ def prepare_and_train(cfg):
         # RESULTS
         # -------------------------
         print("\n FINAL T4 RESULT")
-        print({
-            "best_bleu": best["best_bleu"],
+        result_dict = {
+            "test_loss": None,
             "test_bleu": best["test_bleu"]
-        })
+        }
+        print(result_dict)
+        return result_dict
 
 
     else:

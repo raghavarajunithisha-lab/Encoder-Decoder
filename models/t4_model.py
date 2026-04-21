@@ -123,26 +123,35 @@ class TransformerSeq2Seq(nn.Module):
     def __init__(self, cfg, src_vocab, tgt_vocab):
         super().__init__()
 
-        self.use_tda = cfg.USE_TDA
+        self.use_tda = getattr(cfg, "USE_TDA", False)
+        tda_dim = getattr(cfg, "TDA_PCA_COMPONENTS", 0) if self.use_tda else 0
+        
+        # d_model remains strictly fixed to EMBED_SIZE for ablation
+        d_model = cfg.EMBED_SIZE
 
-        self.src_emb = nn.Embedding(len(src_vocab), cfg.EMBED_SIZE, padding_idx=0)
-        self.tgt_emb = nn.Embedding(len(tgt_vocab), cfg.EMBED_SIZE, padding_idx=0)
-        self.pos = PositionalEncoding(cfg.EMBED_SIZE)
+        self.src_emb = nn.Embedding(len(src_vocab), d_model, padding_idx=0)
+        self.tgt_emb = nn.Embedding(len(tgt_vocab), d_model, padding_idx=0)
+        
+        # Linear projection to natively inject TDA components into d_model dimensional space
+        if self.use_tda and tda_dim > 0:
+            self.tda_proj = nn.Linear(tda_dim, d_model)
+        else:
+            self.tda_proj = None
+
+        self.pos = PositionalEncoding(d_model)
         self.drop = nn.Dropout(cfg.DROPOUT)
 
         enc_layer = nn.TransformerEncoderLayer(
-            cfg.EMBED_SIZE, cfg.NUM_HEADS, cfg.FF_DIM, cfg.DROPOUT, batch_first=True
+            d_model, cfg.NUM_HEADS, cfg.FF_DIM, cfg.DROPOUT, batch_first=True
         )
         dec_layer = nn.TransformerDecoderLayer(
-            cfg.EMBED_SIZE, cfg.NUM_HEADS, cfg.FF_DIM, cfg.DROPOUT, batch_first=True
+            d_model, cfg.NUM_HEADS, cfg.FF_DIM, cfg.DROPOUT, batch_first=True
         )
 
         self.encoder = nn.TransformerEncoder(enc_layer, cfg.NUM_LAYERS)
         self.decoder = nn.TransformerDecoder(dec_layer, cfg.NUM_LAYERS)
 
-        self.fc = nn.Linear(cfg.EMBED_SIZE, len(tgt_vocab))
-
-        self.tda_proj = nn.Linear(cfg.TDA_PCA_COMPONENTS, cfg.EMBED_SIZE)
+        self.fc = nn.Linear(d_model, len(tgt_vocab))
 
     def forward(self, src, tgt_in, tda=None):
         src_pad = (src == 0)
@@ -154,14 +163,17 @@ class TransformerSeq2Seq(nn.Module):
             diagonal=1
         ).bool()
 
-        src_emb = self.drop(self.pos(self.src_emb(src)))
+        src_emb_base = self.src_emb(src)
+        if getattr(self, "tda_proj", None) is not None and tda is not None:
+            # Project TDA vector -> d_model space, broadcast across seq_len, and add element-wise
+            proj_tda = self.tda_proj(tda)
+            tda_seq = proj_tda.unsqueeze(1).expand(-1, src.size(1), -1)
+            src_emb_base = src_emb_base + tda_seq
+
+        src_emb = self.drop(self.pos(src_emb_base))
         tgt_emb = self.drop(self.pos(self.tgt_emb(tgt_in)))
 
         memory = self.encoder(src_emb, src_key_padding_mask=src_pad)
-
-        if self.use_tda and tda is not None:
-            tda_vec = torch.tanh(self.tda_proj(tda)).unsqueeze(1)
-            memory = memory + tda_vec
 
         out = self.decoder(
             tgt_emb, memory,
@@ -196,7 +208,7 @@ def train_t4(cfg, train_loader, val_loader, test_loader,
         total_loss = 0
         train_preds, train_refs = [], []
 
-        for src, tgt, tda in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
+        for src, tgt, tda in tqdm(train_loader, desc=f"Epoch {epoch+1}", disable=True):
             src, tgt = src.to(device), tgt.to(device)
             tda = None if tda is None else tda.to(device)
 
@@ -238,7 +250,7 @@ def train_t4(cfg, train_loader, val_loader, test_loader,
         val_loss = 0
 
         with torch.no_grad():
-            for src, tgt, tda in val_loader:
+            for src, tgt, tda in tqdm(val_loader, desc=f"Epoch {epoch+1} Validation", disable=True):
                 src, tgt = src.to(device), tgt.to(device)
                 tda = None if tda is None else tda.to(device)
 
@@ -294,11 +306,12 @@ def train_t4(cfg, train_loader, val_loader, test_loader,
 
     # -------- TEST --------
     model.load_state_dict(torch.load("best_t4_transformer.pth"))
+    import os; os.remove("best_t4_transformer.pth")  # delete to free disk space
     model.eval()
 
     preds, refs = [], []
     with torch.no_grad():
-        for src, tgt, tda in test_loader:
+        for src, tgt, tda in tqdm(test_loader, desc="Testing", disable=True):
             src, tgt = src.to(device), tgt.to(device)
             tda = None if tda is None else tda.to(device)
 
