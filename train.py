@@ -230,9 +230,22 @@ def prepare_and_train(cfg):
 
         print("\n FINAL TEST EVALUATION (BART)")
         test_results = trainer.evaluate(eval_dataset=tok_test, metric_key_prefix="test")
+        print(f"[DEBUG] BART evaluate() returned keys: {list(test_results.keys())}")
+        print(f"[DEBUG] BART evaluate() full results: {test_results}")
+
+        # Robust lookup: find the bertscore key regardless of exact prefix
+        bleu_val = test_results.get("test_bertscore_f1")
+        if bleu_val is None:
+            # Search for any key containing 'bertscore_f1'
+            for k, v in test_results.items():
+                if "bertscore_f1" in k:
+                    bleu_val = v
+                    print(f"[DEBUG] Found bertscore under key '{k}': {v}")
+                    break
+
         result_dict = {
             "test_loss": test_results.get("test_loss"),
-            "test_bleu": test_results.get("test_bertscore_f1")
+            "test_bleu": bleu_val
         }
         print(result_dict)
         return result_dict
@@ -457,7 +470,7 @@ def prepare_and_train(cfg):
         # -------------------------
         print("\n FINAL T4 RESULT")
         result_dict = {
-            "test_loss": None,
+            "test_loss": best["test_loss"],
             "test_bleu": best["test_bleu"]
         }
         print(result_dict)

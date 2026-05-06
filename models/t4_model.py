@@ -309,6 +309,23 @@ def train_t4(cfg, train_loader, val_loader, test_loader,
     import os; os.remove("best_t4_transformer.pth")  # delete to free disk space
     model.eval()
 
+    # --- Compute test loss (teacher-forcing) ---
+    test_loss_total = 0
+    test_loss_batches = 0
+    with torch.no_grad():
+        for src, tgt, tda in test_loader:
+            src, tgt = src.to(device), tgt.to(device)
+            tda = None if tda is None else tda.to(device)
+            logits = model(src, tgt[:, :-1], tda)
+            loss = criterion(
+                logits.reshape(-1, logits.size(-1)),
+                tgt[:, 1:].reshape(-1)
+            )
+            test_loss_total += loss.item()
+            test_loss_batches += 1
+    test_loss = test_loss_total / max(test_loss_batches, 1)
+
+    # --- Compute test BLEU (autoregressive generation) ---
     preds, refs = [], []
     with torch.no_grad():
         for src, tgt, tda in tqdm(test_loader, desc="Testing", disable=True):
@@ -339,5 +356,6 @@ def train_t4(cfg, train_loader, val_loader, test_loader,
         "model": model,
         "history": history,
         "best_bleu": best_bleu,
+        "test_loss": test_loss,
         "test_bleu": test_bleu
     }
