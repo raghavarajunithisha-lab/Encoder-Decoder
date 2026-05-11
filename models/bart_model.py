@@ -181,7 +181,7 @@ def get_trainer(model, tokenizer, train_dataset, eval_dataset, test_dataset, dat
                 print(f"EarlyStopping counter: {self.counter} / {self.patience}")
 
                 if self.counter >= self.patience:
-                    print("🛑 Early stopping triggered")
+                    print("Early stopping triggered")
                     self.early_stop = True
                     control.should_training_stop = True
 
