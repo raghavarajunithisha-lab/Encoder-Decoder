@@ -199,6 +199,7 @@ def train_t4(cfg, train_loader, val_loader, test_loader,
     best_bleu = -1.0
     patience = cfg.EARLY_STOPPING_PATIENCE
     no_improve_epochs = 0
+    best_model_state = None  # Store best model state in memory instead of disk
 
     history = []
 
@@ -228,16 +229,18 @@ def train_t4(cfg, train_loader, val_loader, test_loader,
             # ---- TRAIN BLEU GENERATION ----
             pred_ids = logits.argmax(-1)
             for i in range(src.size(0)):
-                pred_tokens = [
-                    tgt_vocab.idx_to_token(int(x))
-                    for x in pred_ids[i]
-                    if tgt_vocab.idx_to_token(int(x)) != EOS_TOKEN
-                ]
-                ref_tokens = [
-                    tgt_vocab.idx_to_token(int(x))
-                    for x in tgt[i][1:]
-                    if tgt_vocab.idx_to_token(int(x)) != EOS_TOKEN
-                ]
+                pred_tokens = []
+                for x in pred_ids[i]:
+                    t = tgt_vocab.idx_to_token(int(x))
+                    if t == EOS_TOKEN: break
+                    if t not in (PAD_TOKEN, SOS_TOKEN): pred_tokens.append(t)
+                
+                ref_tokens = []
+                for x in tgt[i][1:]:
+                    t = tgt_vocab.idx_to_token(int(x))
+                    if t == EOS_TOKEN: break
+                    if t not in (PAD_TOKEN, SOS_TOKEN): ref_tokens.append(t)
+                
                 train_preds.append(" ".join(pred_tokens))
                 train_refs.append(" ".join(ref_tokens))
 
@@ -264,16 +267,18 @@ def train_t4(cfg, train_loader, val_loader, test_loader,
 
                 pred_ids = logits.argmax(-1)
                 for i in range(src.size(0)):
-                    pred_tokens = [
-                        tgt_vocab.idx_to_token(int(x))
-                        for x in pred_ids[i]
-                        if tgt_vocab.idx_to_token(int(x)) != EOS_TOKEN
-                    ]
-                    ref_tokens = [
-                        tgt_vocab.idx_to_token(int(x))
-                        for x in tgt[i][1:]
-                        if tgt_vocab.idx_to_token(int(x)) != EOS_TOKEN
-                    ]
+                    pred_tokens = []
+                    for x in pred_ids[i]:
+                        t = tgt_vocab.idx_to_token(int(x))
+                        if t == EOS_TOKEN: break
+                        if t not in (PAD_TOKEN, SOS_TOKEN): pred_tokens.append(t)
+                    
+                    ref_tokens = []
+                    for x in tgt[i][1:]:
+                        t = tgt_vocab.idx_to_token(int(x))
+                        if t == EOS_TOKEN: break
+                        if t not in (PAD_TOKEN, SOS_TOKEN): ref_tokens.append(t)
+                    
                     val_preds.append(" ".join(pred_tokens))
                     val_refs.append(" ".join(ref_tokens))
 
@@ -297,7 +302,8 @@ def train_t4(cfg, train_loader, val_loader, test_loader,
         if val_bleu > best_bleu:
             best_bleu = val_bleu
             no_improve_epochs = 0
-            torch.save(model.state_dict(), "best_t4_transformer.pth")
+            # Store best model state in memory (avoids disk file collision issues)
+            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         else:
             no_improve_epochs += 1
             if no_improve_epochs >= patience:
@@ -305,8 +311,10 @@ def train_t4(cfg, train_loader, val_loader, test_loader,
                 break
 
     # -------- TEST --------
-    model.load_state_dict(torch.load("best_t4_transformer.pth"))
-    import os; os.remove("best_t4_transformer.pth")  # delete to free disk space
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    else:
+        print("[T4 WARNING] No best model state saved — using final epoch weights")
     model.eval()
 
     # --- Compute test loss (teacher-forcing) ---
@@ -324,6 +332,7 @@ def train_t4(cfg, train_loader, val_loader, test_loader,
             test_loss_total += loss.item()
             test_loss_batches += 1
     test_loss = test_loss_total / max(test_loss_batches, 1)
+    print(f"[T4 DEBUG] test_loss_total={test_loss_total}, test_loss_batches={test_loss_batches}, test_loss={test_loss}")
 
     # --- Compute test BLEU (autoregressive generation) ---
     preds, refs = [], []
@@ -338,20 +347,25 @@ def train_t4(cfg, train_loader, val_loader, test_loader,
             for _ in range(cfg.MAX_OUTPUT_LEN):
                 logits = model(src[:1], gen, tda[:1] if tda is not None else None)
                 nxt = logits[:, -1].argmax(-1).item()
-                if tgt_vocab.idx_to_token(nxt) == EOS_TOKEN:
+                t = tgt_vocab.idx_to_token(nxt)
+                if t == EOS_TOKEN:
                     break
-                out.append(tgt_vocab.idx_to_token(nxt))
+                if t not in (PAD_TOKEN, SOS_TOKEN):
+                    out.append(t)
                 gen = torch.cat([gen, torch.tensor([[nxt]], device=device)], 1)
 
             preds.append(" ".join(out))
-            refs.append(" ".join(
-                tgt_vocab.idx_to_token(int(x))
-                for x in tgt[0][1:]
-                if tgt_vocab.idx_to_token(int(x)) != EOS_TOKEN
-            ))
+            
+            r_tokens = []
+            for x in tgt[0][1:]:
+                t = tgt_vocab.idx_to_token(int(x))
+                if t == EOS_TOKEN: break
+                if t not in (PAD_TOKEN, SOS_TOKEN): r_tokens.append(t)
+            refs.append(" ".join(r_tokens))
 
     test_bleu = sacrebleu.corpus_bleu(preds, [[r] for r in refs]).score / 100
 
+    print(f"[T4 DEBUG] Final test_loss={test_loss}, test_bleu={test_bleu}")
     return {
         "model": model,
         "history": history,

@@ -186,6 +186,7 @@ def train_gru(cfg, train_loader, val_loader, test_loader,
 
     best_bleu = -1.0
     epochs_no_improve = 0
+    best_state = None  # Store best model state in memory
 
     def greedy_decode(enc_out, h, mask, max_len, tda_batch):
         batch_size = enc_out.size(0)
@@ -204,6 +205,7 @@ def train_gru(cfg, train_loader, val_loader, test_loader,
             tokens = [tgt_vocab.idx_to_token(t) for t in p]
             if EOS_TOKEN in tokens:
                 tokens = tokens[:tokens.index(EOS_TOKEN)]
+            tokens = [t for t in tokens if t not in (PAD_TOKEN, SOS_TOKEN)]
             results.append(" ".join(tokens))
         return results
 
@@ -243,6 +245,7 @@ def train_gru(cfg, train_loader, val_loader, test_loader,
                     ref_tokens = [tgt_vocab.idx_to_token(idx.item()) for idx in tgt[j]][1:]
                     if EOS_TOKEN in ref_tokens:
                         ref_tokens = ref_tokens[:ref_tokens.index(EOS_TOKEN)]
+                    ref_tokens = [t for t in ref_tokens if t not in (PAD_TOKEN, SOS_TOKEN)]
                     refs.append(" ".join(ref_tokens))
 
         avg_loss = total_loss / total_ex if total_ex > 0 else 0.0
@@ -291,8 +294,10 @@ def train_gru(cfg, train_loader, val_loader, test_loader,
 
         if val_bleu > best_bleu:
             best_bleu = val_bleu
-            torch.save({"encoder": encoder.state_dict(),
-                        "decoder": decoder.state_dict()}, "best_gru.pth")
+            best_state = {
+                'encoder': {k: v.cpu().clone() for k, v in encoder.state_dict().items()},
+                'decoder': {k: v.cpu().clone() for k, v in decoder.state_dict().items()}
+            }
             epochs_no_improve = 0
         else:
             epochs_no_improve += 1
@@ -300,10 +305,11 @@ def train_gru(cfg, train_loader, val_loader, test_loader,
                 print(f"Early stopping at epoch {epoch}")
                 break
 
-    ckpt = torch.load("best_gru.pth", map_location=device)
-    encoder.load_state_dict(ckpt["encoder"])
-    decoder.load_state_dict(ckpt["decoder"])
-    import os; os.remove("best_gru.pth")  # delete to free disk space
+    if best_state is not None:
+        encoder.load_state_dict(best_state['encoder'])
+        decoder.load_state_dict(best_state['decoder'])
+    else:
+        print("[GRU WARNING] No best model state saved — using final epoch weights")
 
     test_loss, test_bleu = evaluate(test_loader)
 

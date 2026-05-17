@@ -99,6 +99,8 @@ def run_experiments():
                     if result:
                         metrics = result
                 except Exception as e:
+                    import traceback
+                    traceback.print_exc()
                     print(f"!!! ERROR in {model_name} on {dataset_name} (TDA={tda_status}): {e}")
                     metrics = {"test_loss": None, "test_bleu": None, "error": str(e)}
                 finally:
@@ -120,6 +122,27 @@ def run_experiments():
                 all_results.append(row)
                 _append_result_to_csv(row)
                 print(f"[SAVED] Result appended to {RESULTS_CSV}")
+
+                # --- Validation: flag potential issues ---
+                if row["test_loss"] is None:
+                    print(f"[⚠ WARNING] test_loss is None for {model_name} on {dataset_name} (TDA={tda_status})")
+                if row["test_bleu"] is None:
+                    print(f"[⚠ WARNING] test_bleu is None for {model_name} on {dataset_name} (TDA={tda_status})")
+
+                # Check for identical results between TDA=True and TDA=False
+                if not tda_status:  # just finished TDA=False, compare with TDA=True
+                    prev = [r for r in all_results
+                            if r["model"] == model_name and r["dataset"] == dataset_name and r["tda"] == True]
+                    if prev:
+                        prev_row = prev[-1]
+                        if prev_row["test_loss"] == row["test_loss"] and prev_row["test_bleu"] == row["test_bleu"]:
+                            print(f"[❌ BUG DETECTED] TDA=True and TDA=False gave IDENTICAL results for {model_name}!")
+                            print(f"    TDA=True:  loss={prev_row['test_loss']}, bleu={prev_row['test_bleu']}")
+                            print(f"    TDA=False: loss={row['test_loss']}, bleu={row['test_bleu']}")
+                        else:
+                            print(f"[✅ OK] TDA=True and TDA=False gave DIFFERENT results for {model_name}")
+                            print(f"    TDA=True:  loss={prev_row['test_loss']}, bleu={prev_row['test_bleu']}")
+                            print(f"    TDA=False: loss={row['test_loss']}, bleu={row['test_bleu']}")
 
     total_elapsed = time.time() - total_t0
     print(f"\n{'='*80}")

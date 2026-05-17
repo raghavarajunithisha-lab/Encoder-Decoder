@@ -107,9 +107,19 @@ def run_evaluation(encoder, decoder, loader, tgt_vocab, device, loss_fn=None):
                     batch_preds[i].append(tgt_vocab.idx_to_token(token_id.item()))
 
             for i in range(src.size(0)):
-                ref_tokens = [tgt_vocab.idx_to_token(tid.item()) for tid in tgt[i][1:]]
-                all_preds.append(" ".join([t for t in batch_preds[i] if t not in special]))
-                all_refs.append(" ".join([t for t in ref_tokens if t not in special]))
+                p_tokens = []
+                for t in batch_preds[i]:
+                    if t == EOS_TOKEN: break
+                    if t not in special: p_tokens.append(t)
+                
+                r_tokens = []
+                for tid in tgt[i][1:]:
+                    t = tgt_vocab.idx_to_token(tid.item())
+                    if t == EOS_TOKEN: break
+                    if t not in special: r_tokens.append(t)
+                
+                all_preds.append(" ".join(p_tokens))
+                all_refs.append(" ".join(r_tokens))
 
     bleu = sacrebleu.corpus_bleu(all_preds, [[r] for r in all_refs]).score / 100
     avg_loss = total_loss / (len(loader) * tgt.size(1)) if loss_fn else 0
@@ -126,6 +136,7 @@ def train_lstm(cfg, train_loader, val_loader, test_loader, src_vocab, tgt_vocab,
     loss_fn = nn.CrossEntropyLoss(ignore_index=0)
 
     best_bleu, counter, patience = 0.0, 0, 3
+    best_state = None  # Store best model state in memory
     history = []
 
     from tqdm import tqdm
@@ -159,15 +170,20 @@ def train_lstm(cfg, train_loader, val_loader, test_loader, src_vocab, tgt_vocab,
 
         if val_bleu > best_bleu:
             best_bleu, counter = val_bleu, 0
-            torch.save({'encoder': encoder.state_dict(), 'decoder': decoder.state_dict()}, "best_lstm.pth")
+            best_state = {
+                'encoder': {k: v.cpu().clone() for k, v in encoder.state_dict().items()},
+                'decoder': {k: v.cpu().clone() for k, v in decoder.state_dict().items()}
+            }
         else:
             counter += 1
             if counter >= patience:
                 print("Early stopping triggered."); break
 
-    checkpoint = torch.load("best_lstm.pth")
-    encoder.load_state_dict(checkpoint['encoder']); decoder.load_state_dict(checkpoint['decoder'])
-    import os; os.remove("best_lstm.pth")  # delete to free disk space
+    if best_state is not None:
+        encoder.load_state_dict(best_state['encoder'])
+        decoder.load_state_dict(best_state['decoder'])
+    else:
+        print("[LSTM WARNING] No best model state saved — using final epoch weights")
     test_bleu, test_loss = run_evaluation(encoder, decoder, test_loader, tgt_vocab, device, loss_fn)
 
     return {"history": history, "best_bleu": best_bleu, "test_loss": test_loss, "test_bleu": test_bleu}

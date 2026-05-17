@@ -29,6 +29,7 @@ from torch.utils.data import DataLoader
 import torch
 
 def set_seed(seed):
+    os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
@@ -207,6 +208,17 @@ def prepare_and_train(cfg):
     # ---------- MODEL TRAINING ----------
     model_name = getattr(cfg, "MODEL_NAME", None)
 
+    # --- Verify TDA data ---
+    tda_status = getattr(cfg, "USE_TDA", False)
+    if tda_status:
+        if tda_train is not None:
+            print(f"[TDA VERIFIED] TDA features loaded: train={tda_train.shape}, val={tda_val.shape}, test={tda_test.shape}")
+        else:
+            print("[TDA ERROR] USE_TDA=True but tda_train is None! TDA computation failed.")
+    else:
+        print(f"[TDA DISABLED] Running without TDA features")
+        assert tda_train is None, "Bug: tda_train should be None when USE_TDA=False"
+
     if model_name == "BART":
         tokenizer, tok_train, data_collator = bart_model.prepare_tokenized_datasets(
             train_df, cfg, tda_array=tda_train if cfg.USE_TDA else None
@@ -230,18 +242,8 @@ def prepare_and_train(cfg):
 
         print("\n FINAL TEST EVALUATION (BART)")
         test_results = trainer.evaluate(eval_dataset=tok_test, metric_key_prefix="test")
-        print(f"[DEBUG] BART evaluate() returned keys: {list(test_results.keys())}")
-        print(f"[DEBUG] BART evaluate() full results: {test_results}")
-
-        # Robust lookup: find the bertscore key regardless of exact prefix
-        bleu_val = test_results.get("test_bertscore_f1")
-        if bleu_val is None:
-            # Search for any key containing 'bertscore_f1'
-            for k, v in test_results.items():
-                if "bertscore_f1" in k:
-                    bleu_val = v
-                    print(f"[DEBUG] Found bertscore under key '{k}': {v}")
-                    break
+        # Extract BLEU (now using sacrebleu, consistent with other models)
+        bleu_val = test_results.get("test_bleu")
 
         result_dict = {
             "test_loss": test_results.get("test_loss"),

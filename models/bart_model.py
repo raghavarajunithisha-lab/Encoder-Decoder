@@ -5,6 +5,7 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
+import sacrebleu
 from datasets import Dataset
 from transformers import (
     BartTokenizerFast,
@@ -18,7 +19,7 @@ from transformers import logging as hf_logging
 hf_logging.set_verbosity_error()
 hf_logging.disable_progress_bar()
 
-from evaluate import load as load_metric
+
 from transformers import TrainerCallback
 
 from transformers import EarlyStoppingCallback
@@ -115,7 +116,14 @@ class EpochEvalCallback(TrainerCallback):
 
 
 def get_trainer(model, tokenizer, train_dataset, eval_dataset, test_dataset, data_collator, cfg):
-    metric = load_metric("bertscore")
+    # --- DEBUG: Verify TDA column presence ---
+    use_tda = getattr(model, "use_tda", False)
+    has_tda_col = "tda" in (train_dataset.column_names if hasattr(train_dataset, 'column_names') else [])
+    print(f"[BART get_trainer] model.use_tda={use_tda}, 'tda' column in train_dataset={has_tda_col}")
+    if use_tda and not has_tda_col:
+        print("[BART WARNING] model.use_tda=True but no 'tda' column found in train_dataset!")
+    if not use_tda and has_tda_col:
+        print("[BART WARNING] model.use_tda=False but 'tda' column IS present — it will be ignored by the model.")
 
     def compute_metrics(eval_pred):
         preds, labels = eval_pred
@@ -126,9 +134,13 @@ def get_trainer(model, tokenizer, train_dataset, eval_dataset, test_dataset, dat
         labels = np.where(labels != -100, labels, pad_id)
         decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
         decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
-        results = metric.compute(predictions=decoded_preds, references=decoded_labels, lang="en")
+        # Use sacrebleu for BLEU — consistent with LSTM/GRU/T4 metrics
+        bleu = sacrebleu.corpus_bleu(
+            decoded_preds,
+            [[r] for r in decoded_labels]
+        ).score / 100.0
         return {
-            "bertscore_f1": float(np.mean(results["f1"]))
+            "bleu": bleu
         }
 
     training_args = Seq2SeqTrainingArguments(
@@ -199,6 +211,37 @@ def get_trainer(model, tokenizer, train_dataset, eval_dataset, test_dataset, dat
     early_stopping = EarlyStoppingCallbackCustom(patience=3,delta=0.0)
 
     class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+        def _remove_unused_columns(self, dataset, description=None):
+            # CRITICAL FIX: The parent class inspects model.forward() signature
+            # and drops any dataset columns not found there. Our monkey-patched
+            # forward hides 'tda' inside **kwargs, so the Trainer silently
+            # drops the TDA column — making TDA and non-TDA runs identical.
+            #
+            # We must still remove raw text columns (e.g. human_input) that
+            # can't be converted to tensors, so we call the parent first
+            # then re-add 'tda' if it was present in the original dataset.
+            has_tda = "tda" in dataset.column_names if hasattr(dataset, "column_names") else False
+            if has_tda:
+                tda_data = dataset["tda"]
+
+            # Let parent remove genuinely unused columns (raw text, etc.)
+            dataset = super()._remove_unused_columns(dataset, description)
+
+            # Re-add 'tda' if it was removed
+            if has_tda and hasattr(dataset, "column_names") and "tda" not in dataset.column_names:
+                dataset = dataset.add_column("tda", tda_data)
+
+            return dataset
+
+        def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+            # model.generate() does NOT accept 'tda' — it validates model_kwargs
+            # and raises ValueError for unknown keys. We pop 'tda' from inputs
+            # before calling the parent prediction_step (which calls generate()).
+            # The forward pass for loss computation receives tda via **kwargs
+            # from our monkey-patch, but generate() must not see it.
+            inputs.pop("tda", None)
+            return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+
         def create_optimizer(self):
             if self.optimizer is None:
                 self.optimizer = torch.optim.AdamW(
